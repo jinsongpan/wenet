@@ -8,7 +8,6 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "torch/script.h"
-#include "torch/torch.h"
 
 #include "decoder/symbol_table.h"
 #include "decoder/torch_asr_decoder.h"
