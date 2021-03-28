@@ -23,7 +23,7 @@ TorchAsrDecoder::TorchAsrDecoder(
 
 void TorchAsrDecoder::Reset() {
   start_ = false;
-  result_ = "";
+  result_.clear();
   offset_ = 0;
   num_frames_in_current_chunk_ = 0;
   subsampling_cache_ = std::move(torch::jit::IValue());
@@ -121,13 +121,7 @@ bool TorchAsrDecoder::AdvanceDecoding() {
                                       .toTensor()[0];
     encoder_outs_.push_back(std::move(chunk_out));
     ctc_prefix_beam_searcher_->Search(ctc_log_probs);
-    auto hypotheses = ctc_prefix_beam_searcher_->hypotheses();
-    const std::vector<int>& best_hyp = hypotheses[0];
-    result_ = "";
-    for (int id : best_hyp) {
-      result_ += symbol_table_.Find(id);
-    }
-    VLOG(1) << "Partial CTC result " << result_;
+    UpdateResult();
 
     // 3. cache feature for next chunk
     if (!finish) {
@@ -146,6 +140,38 @@ bool TorchAsrDecoder::AdvanceDecoding() {
 
   start_ = true;
   return finish;
+}
+
+void TorchAsrDecoder::UpdateResult() {
+  const auto& hypotheses = ctc_prefix_beam_searcher_->hypotheses();
+  const auto& times = ctc_prefix_beam_searcher_->times();
+  const std::vector<int>& best_hyp = hypotheses[0];
+  const std::vector<int>& best_times = times[0];
+
+  int ms_per_step = model_->subsampling_rate() *
+          feature_pipeline_->config().frame_shift *
+          1000 / feature_pipeline_->config().sample_rate;
+  result_.clear();
+
+  for (auto& hypothesis : hypotheses) {
+    std::string path;
+    for (int id : hypothesis) {
+      path += symbol_table_.Find(id);
+    }
+    result_.nbest.emplace_back(ProcessBlank(path));
+  }
+
+  int start = 0;
+  CHECK_EQ(best_hyp.size(), best_times.size());
+  for (size_t i = 0; i < best_hyp.size(); i++) {
+    WordPiece word_piece;
+    word_piece.word = symbol_table_.Find(best_hyp[i]);
+    word_piece.start = start;
+    word_piece.end = best_times[i] * ms_per_step;
+    start = word_piece.end;
+    result_.word_pieces.emplace_back(word_piece);
+  }
+  VLOG(1) << "Partial CTC result " << result_;
 }
 
 static bool CompareFunc(const std::pair<int, float>& a,
@@ -210,9 +236,6 @@ void TorchAsrDecoder::AttentionRescoring() {
     }
     VLOG(1) << "ctc index " << best_k << " result " << result << " score "
             << weighted_scores[i].second;
-    if (0 == i) {
-      result_ = ProcessBlank(result);
-    }
   }
 }
 

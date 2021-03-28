@@ -86,10 +86,10 @@ target_link_libraries(frontend PUBLIC glog)
 
 # decoder
 add_library(decoder STATIC
-  utils/utils.cc
   decoder/ctc_prefix_beam_search.cc
   decoder/torch_asr_decoder.cc
   decoder/torch_asr_model.cc
+  utils/utils.cc
 )
 target_link_libraries(decoder PUBLIC glog ${TORCH_LIBRARIES})
 
