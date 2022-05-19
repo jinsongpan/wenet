@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from wenet.dataset.dataset import Dataset
 from wenet.transformer.asr_model import init_asr_model
 from wenet.wav2vec.wav2vec2_model import init_wav2vec2_model
+from wenet.data2vec.data2vec_model import init_data2vec_model
 from wenet.utils.checkpoint import (load_checkpoint, save_checkpoint,
                                     load_trained_modules)
 from wenet.utils.executor import Executor
@@ -185,7 +186,12 @@ def main():
         wav2vec_conf=configs['wav2vec_conf']
         wav2vec_conf['pretrain']=pretrain
     else:
-        wav2vec_conf=None 
+        wav2vec_conf=None
+    if 'data2vec_conf' in configs:
+        data2vec_conf=configs['data2vec_conf']
+        data2vec_conf['pretrain']=pretrain
+    else:
+        data2vec_conf=None  
 
     # Save configs to model_dir/train.yaml for inference and export
     configs['input_dim'] = input_dim
@@ -201,16 +207,20 @@ def main():
     # Init asr model from configs
     if wav2vec_conf:
         model=init_wav2vec2_model(configs)
+    elif data2vec_conf:
+        model=init_data2vec_model(configs)
     else:
         model = init_asr_model(configs)
-    print(model)
-    num_params = sum(p.numel() for p in model.parameters())
-    print('the number of model params: {}'.format(num_params))
+    if args.rank == 0:
+        print(model)
+        num_params = sum(p.numel() for p in model.parameters())
+        print('the number of model params: {}'.format(num_params))
 
     # !!!IMPORTANT!!!
+    # Now the pretrain model does not  support jit export  
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    if  args.rank == 0 and not pretrain and wav2vec_conf is None:
+    if  args.rank == 0 and not pretrain and wav2vec_conf is None and data2vec_conf is None:
         script_model = torch.jit.script(model)
         script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
