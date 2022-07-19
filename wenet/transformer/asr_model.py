@@ -11,22 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified from ESPnet(https://github.com/espnet/espnet)
 
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from torch.nn.utils.rnn import pad_sequence
 
-from wenet.transformer.cmvn import GlobalCMVN
 from wenet.transformer.ctc import CTC
-from wenet.transformer.decoder import (TransformerDecoder,
-                                       BiTransformerDecoder)
-from wenet.transformer.encoder import ConformerEncoder
+from wenet.transformer.decoder import TransformerDecoder
 from wenet.transformer.encoder import TransformerEncoder
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
-from wenet.utils.cmvn import load_cmvn
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
                                 remove_duplicates_and_blank, th_accuracy,
                                 reverse_pad_list)
@@ -75,8 +72,7 @@ class ASRModel(torch.nn.Module):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor]]:
+    ) -> Dict[str, Optional[torch.Tensor]]:
         """Frontend + Encoder + Decoder + Calc loss
 
         Args:
@@ -115,7 +111,7 @@ class ASRModel(torch.nn.Module):
         else:
             loss = self.ctc_weight * loss_ctc + (1 -
                                                  self.ctc_weight) * loss_att
-        return loss, loss_att, loss_ctc
+        return {"loss": loss, "loss_att": loss_att, "loss_ctc": loss_ctc}
 
     def _calc_att_loss(
         self,
@@ -573,33 +569,42 @@ class ASRModel(torch.nn.Module):
         xs: torch.Tensor,
         offset: int,
         required_cache_size: int,
-        subsampling_cache: Optional[torch.Tensor] = None,
-        elayers_output_cache: Optional[List[torch.Tensor]] = None,
-        conformer_cnn_cache: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor],
-               List[torch.Tensor]]:
+        att_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ Export interface for c++ call, give input chunk xs, and return
             output from time 0 to current chunk.
 
         Args:
-            xs (torch.Tensor): chunk input
-            subsampling_cache (Optional[torch.Tensor]): subsampling cache
-            elayers_output_cache (Optional[List[torch.Tensor]]):
-                transformer/conformer encoder layers output cache
-            conformer_cnn_cache (Optional[List[torch.Tensor]]): conformer
-                cnn cache
+            xs (torch.Tensor): chunk input, with shape (b=1, time, mel-dim),
+                where `time == (chunk_size - 1) * subsample_rate + \
+                        subsample.right_context + 1`
+            offset (int): current offset in encoder output time stamp
+            required_cache_size (int): cache size required for next chunk
+                compuation
+                >=0: actual cache size
+                <0: means all history cache is required
+            att_cache (torch.Tensor): cache tensor for KEY & VALUE in
+                transformer/conformer attention, with shape
+                (elayers, head, cache_t1, d_k * 2), where
+                `head * d_k == hidden-dim` and
+                `cache_t1 == chunk_size * num_decoding_left_chunks`.
+            cnn_cache (torch.Tensor): cache tensor for cnn_module in conformer,
+                (elayers, b=1, hidden-dim, cache_t2), where
+                `cache_t2 == cnn.lorder - 1`
 
         Returns:
-            torch.Tensor: output, it ranges from time 0 to current chunk.
-            torch.Tensor: subsampling cache
-            List[torch.Tensor]: attention cache
-            List[torch.Tensor]: conformer cnn cache
+            torch.Tensor: output of current input xs,
+                with shape (b=1, chunk_size, hidden-dim).
+            torch.Tensor: new attention cache required for next chunk, with
+                dynamic shape (elayers, head, ?, d_k * 2)
+                depending on required_cache_size.
+            torch.Tensor: new conformer cnn cache required for next chunk, with
+                same shape as the original cnn_cache.
 
         """
         return self.encoder.forward_chunk(xs, offset, required_cache_size,
-                                          subsampling_cache,
-                                          elayers_output_cache,
-                                          conformer_cnn_cache)
+                                          att_cache, cnn_cache)
 
     @torch.jit.export
     def ctc_activation(self, xs: torch.Tensor) -> torch.Tensor:
@@ -657,14 +662,60 @@ class ASRModel(torch.nn.Module):
                                   encoder_out.size(1),
                                   dtype=torch.bool,
                                   device=encoder_out.device)
+
         # input for right to left decoder
         # this hyps_lens has count <sos> token, we need minus it.
         r_hyps_lens = hyps_lens - 1
         # this hyps has included <sos> token, so it should be
         # convert the original hyps.
         r_hyps = hyps[:, 1:]
-        r_hyps = reverse_pad_list(r_hyps, r_hyps_lens, float(self.ignore_id))
-        r_hyps, _ = add_sos_eos(r_hyps, self.sos, self.eos, self.ignore_id)
+        #   >>> r_hyps
+        #   >>> tensor([[ 1,  2,  3],
+        #   >>>         [ 9,  8,  4],
+        #   >>>         [ 2, -1, -1]])
+        #   >>> r_hyps_lens
+        #   >>> tensor([3, 3, 1])
+
+        # NOTE(Mddct): `pad_sequence` is not supported by ONNX, it is used
+        #   in `reverse_pad_list` thus we have to refine the below code.
+        #   Issue: https://github.com/wenet-e2e/wenet/issues/1113
+        # Equal to:
+        #   >>> r_hyps = reverse_pad_list(r_hyps, r_hyps_lens, float(self.ignore_id))
+        #   >>> r_hyps, _ = add_sos_eos(r_hyps, self.sos, self.eos, self.ignore_id)
+        max_len = torch.max(r_hyps_lens)
+        index_range = torch.arange(0, max_len, 1).to(encoder_out.device)
+        seq_len_expand = r_hyps_lens.unsqueeze(1)
+        seq_mask = seq_len_expand > index_range  # (beam, max_len)
+        #   >>> seq_mask
+        #   >>> tensor([[ True,  True,  True],
+        #   >>>         [ True,  True,  True],
+        #   >>>         [ True, False, False]])
+        index = (seq_len_expand - 1) - index_range  # (beam, max_len)
+        #   >>> index
+        #   >>> tensor([[ 2,  1,  0],
+        #   >>>         [ 2,  1,  0],
+        #   >>>         [ 0, -1, -2]])
+        index = index * seq_mask
+        #   >>> index
+        #   >>> tensor([[2, 1, 0],
+        #   >>>         [2, 1, 0],
+        #   >>>         [0, 0, 0]])
+        r_hyps = torch.gather(r_hyps, 1, index)
+        #   >>> r_hyps
+        #   >>> tensor([[3, 2, 1],
+        #   >>>         [4, 8, 9],
+        #   >>>         [2, 2, 2]])
+        r_hyps = torch.where(seq_mask, r_hyps, self.eos)
+        #   >>> r_hyps
+        #   >>> tensor([[3, 2, 1],
+        #   >>>         [4, 8, 9],
+        #   >>>         [2, eos, eos]])
+        r_hyps = torch.cat([hyps[:, 0:1], r_hyps], dim=1)
+        #   >>> r_hyps
+        #   >>> tensor([[sos, 3, 2, 1],
+        #   >>>         [sos, 4, 8, 9],
+        #   >>>         [sos, 2, eos, eos]])
+
         decoder_out, r_decoder_out, _ = self.decoder(
             encoder_out, encoder_mask, hyps, hyps_lens, r_hyps,
             reverse_weight)  # (num_hyps, max_hyps_len, vocab_size)
@@ -675,45 +726,3 @@ class ASRModel(torch.nn.Module):
         # r_dccoder_out will be 0.0, if reverse_weight is 0.0
         r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
         return decoder_out, r_decoder_out
-
-
-def init_asr_model(configs):
-    if configs['cmvn_file'] is not None:
-        mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
-        global_cmvn = GlobalCMVN(
-            torch.from_numpy(mean).float(),
-            torch.from_numpy(istd).float())
-    else:
-        global_cmvn = None
-
-    input_dim = configs['input_dim']
-    vocab_size = configs['output_dim']
-
-    encoder_type = configs.get('encoder', 'conformer')
-    decoder_type = configs.get('decoder', 'bitransformer')
-
-    if encoder_type == 'conformer':
-        encoder = ConformerEncoder(input_dim,
-                                   global_cmvn=global_cmvn,
-                                   **configs['encoder_conf'])
-    else:
-        encoder = TransformerEncoder(input_dim,
-                                     global_cmvn=global_cmvn,
-                                     **configs['encoder_conf'])
-    if decoder_type == 'transformer':
-        decoder = TransformerDecoder(vocab_size, encoder.output_size(),
-                                     **configs['decoder_conf'])
-    else:
-        assert 0.0 < configs['model_conf']['reverse_weight'] < 1.0
-        assert configs['decoder_conf']['r_num_blocks'] > 0
-        decoder = BiTransformerDecoder(vocab_size, encoder.output_size(),
-                                       **configs['decoder_conf'])
-    ctc = CTC(vocab_size, encoder.output_size())
-    model = ASRModel(
-        vocab_size=vocab_size,
-        encoder=encoder,
-        decoder=decoder,
-        ctc=ctc,
-        **configs['model_conf'],
-    )
-    return model
